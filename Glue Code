@@ -1,0 +1,120 @@
+-- This a complete code that fetches data from inshort API. Cleans the data as required in the objective. And storees the cleaned data in S3 Bucket.
+import urllib.request as ur
+import json
+import pandas as pd
+import boto3
+from io import StringIO
+import time
+from datetime import datetime, timedelta
+
+def fetch_news_data(categories, base_url):
+    all_news = []
+
+    for category in categories:
+        try:
+            # Adding a timestamp to avoid caching
+            full_url = f"{base_url}{category}?timestamp={int(time.time())}"
+            req = ur.Request(full_url, headers={'Cache-Control': 'no-cache'})
+            with ur.urlopen(req) as response:
+                data = json.loads(response.read())
+                news = data.get("data", {}).get("suggested_news", [])
+
+                for item in news:
+                    item['category'] = category
+
+                all_news.extend(news)
+        except Exception as e:
+            print(f"Failed to fetch data for category {category}: {e}")
+
+    return all_news
+
+def save_to_s3(df, bucket_name, file_name):
+    # Convert DataFrame to CSV in memory
+    csv_buffer = StringIO()
+    df.to_csv(csv_buffer, index=False)
+
+    s3_folder = "inshort_data/"
+    full_s3_path = s3_folder + file_name
+
+    # Upload CSV to S3
+    s3_resource = boto3.resource('s3')
+    s3_resource.Object(bucket_name, full_s3_path).put(Body=csv_buffer.getvalue())
+
+def main():
+    cat_url = "https://inshorts.com/api/en/search/trending_topics/"
+    categories = ["FINANCE", "business", "technology", "startup"]
+
+    all_news = fetch_news_data(categories, cat_url)
+
+    df = pd.DataFrame(all_news)
+
+    # Expand the 'news_obj' column into separate columns
+    if 'news_obj' in df.columns:
+        # Convert 'news_obj' column to a DataFrame
+        news_obj_df = pd.json_normalize(df['news_obj'])
+        
+        df = df.drop(columns=['news_obj'])
+        
+        df = pd.concat([df, news_obj_df], axis=1)
+
+    # Remove commas from 'content', 'title' columns if they exist
+    if 'content' in df.columns:
+        df['content'] = df['content'].str.replace(',', '')
+
+    if 'title' in df.columns:
+        df['title'] = df['title'].str.replace(',', '')
+        
+    # Convert 'created_at' from Unix timestamp to datetime
+    if 'created_at' in df.columns:
+        df['created_at'] = pd.to_datetime(df['created_at'], unit='ms')
+
+    # Filter data for the last 24 hours
+    now = datetime.now()
+    one_day_ago = now - timedelta(days=1)
+    df = df[df['created_at'] > one_day_ago]
+
+    columns_to_drop = [
+        'news_type', 'type', 'publisher_interaction_meta', 'old_hash_id', 'important', 
+        'shortened_url', 'score', 'version', 'relevancy_tags',
+        'tenant', 'fb_object_id', 'fb_like_count', 'country_code', 'targeted_city',
+        'gallery_image_urls', 'full_gallery_urls', 'bottom_headline', 'bottom_text',
+        'darker_fonts', 'bottom_panel_link', 'bottom_type', 'byline_1', 'byline_2',
+        'version', 'position_start_time', 'position_expire_time', 'trackers', 'dfp_tags',
+        'dont_show_ad', 'poll_tenant', 'image_for_representation', 'video_opinion_enabled',
+        'show_inshorts_brand_name', 'crypto_coin_preference', 'is_overlay_supported',
+        'news_type', 'is_muted', 'video_audio_type', 'auto_play_type',
+        'show_in_video_feed_only', 'similar_threshold', 'is_similar_feed_available',
+        'show_publisher_info', 'is_profile_clickable', 'capsule_image_url',
+        'capsule_custom_card_id', 'capsule_custom_card_url', 'capsule_campaign',
+        'is_youtube_video', 'publisher_info.name', 'publisher_info.user_id',
+        'publisher_info.user_type', 'publisher_info.profile_image_url',
+        'publisher_info.thumbnail_image_url', 'publisher_info.sponsored_text',
+        'publisher_info.force_show_interested', 'publisher_interaction_meta.user_id',
+        'publisher_interaction_meta.is_publisher_followed',
+        'publisher_interaction_meta.show_follow_button', 'footer_deck_id',
+        'footer_deck_tag_label', 'video_url', 'show_video_as_image', 'video_length','category_names',
+        'sponsored_by','dont_show_time'
+    ]
+
+    # Drop the unnecessary columns
+    df.drop(columns=columns_to_drop, errors='ignore', inplace=True)
+
+    # Add a new 'index' column
+    df['index'] = range(1, len(df) + 1)
+
+    if 'rank' in df.columns:
+        df.drop('rank', axis=1, inplace=True)
+
+    # Drop duplicated columns
+    df = df.loc[:, ~df.columns.duplicated(keep='first')]
+
+    # Move 'index' column to the first position
+    df = df[['index'] + [col for col in df.columns if col != 'index']]
+
+    # Save to S3
+    bucket_name = 'inshort-capstone'  # Replace with your S3 bucket name
+    file_name = 'updated_news_data.csv'
+    save_to_s3(df, bucket_name, file_name)
+
+if __name__ == "__main__":
+    main()
